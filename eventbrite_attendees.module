@@ -1,0 +1,410 @@
+<?php
+
+/**
+ * @file
+ * Brings Eventbrite attendees information on Drupal.
+ */
+
+define('EVENTBRITE_ATTENDEES_ENDPOINT', 'https://www.eventbriteapi.com/v3');
+
+/**
+ * Implements hook_block_info().
+ */
+function eventbrite_attendees_block_info() {
+  $blocks = array();
+
+  $blocks['eventbrite_attendees'] = array(
+    'info' => t('Event attendees'),
+    'cache' => DRUPAL_NO_CACHE,
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_configure().
+ */
+function eventbrite_attendees_block_configure($delta = '') {
+  $form = array();
+  if ($delta == 'eventbrite_attendees') {
+    $form['eventbrite_attendees'] = array(
+      '#type' => 'fieldset',
+      '#title' => 'Eventbrite settings',
+      '#collapsible' => TRUE,
+    );
+    if (user_access('administer site configuration')) {
+      $form['eventbrite_attendees']['eventbrite_attendees_oauth_token'] = array(
+        '#type' => 'textfield',
+        '#title' => t('OAuth token'),
+        '#description' => t('Enter the OAuth token to access Eventbrite API.'),
+        '#default_value' => variable_get('eventbrite_attendees_oauth_token'),
+        '#size' => 50,
+        '#maxlength' => 20,
+        '#required' => TRUE,
+      );
+    }
+    $form['eventbrite_attendees']['eventbrite_attendees_event_id'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Event ID'),
+      '#description' => t('Enter the event ID to get its attendees (use tokens below to retrieve this datum from a specific node field) or <em>&lt;demo&gt;</em> to show dummy entries for testing purposes.'),
+      '#default_value' => variable_get('eventbrite_attendees_event_id', '<demo>'),
+      '#size' => 50,
+      '#maxlength' => 64,
+      '#required' => TRUE,
+    );
+    $form['eventbrite_attendees']['eventbrite_attendees_tokens'] = array(
+      '#theme' => 'token_tree_link',
+      '#token_types' => array('node'),
+      '#global_types' => FALSE,
+    );
+    $fields = _eventbrite_attendees_get_attendees_profile_fields();
+    $draggable_table = array(
+      '#tree' => TRUE,
+      '#theme' => 'eventbrite_attendees_profile_fields',
+      '#title' => t('Attendee profile fields'),
+      '#id' => 'eventbrite-attendees-profile-table',
+    );
+    foreach ($fields as $field_id => $field) {
+      $draggable_table[$field_id] = array(
+        'enabled' => array(
+          '#type' => 'checkbox',
+          '#title' => $field_id,
+          '#default_value' => $field['enabled'],
+        ),
+        'label' => array(
+          '#type' => 'textfield',
+          '#title' => t('Label'),
+          '#default_value' => check_plain($field['label']),
+          '#title_display' => 'invisible',
+        ),
+        'weight' => array(
+          '#type' => 'weight',
+          '#title' => t('Weight'),
+          '#default_value' => (int) $field['weight'],
+          '#delta' => 20,
+          '#title_display' => 'invisible',
+          '#attributes' => array('class' => array('eventbrite-attendees-profile-field-weight')),
+        ),
+      );
+    }
+    $form['eventbrite_attendees']['eventbrite_attendees_profile_fields'] = $draggable_table;
+    $form['eventbrite_attendees']['eventbrite_attendees_cache_length'] = array(
+      '#type' => 'select',
+      '#title' => t('Cache duration'),
+      '#description' => t('Set cache duration to reduce the number of calls to the Eventbrite web service. Decreasing current value will clear cached data.'),
+      '#default_value' => variable_get('eventbrite_attendees_cache_length', 0),
+      '#options' => array(
+        0 => t('Disabled'),
+        1800 => t('30 minutes'),
+        3600 => t('1 hour'),
+        86400 => t('1 day'),
+      ),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_block_save().
+ */
+function eventbrite_attendees_block_save($delta = '', $edit = array()) {
+  if ($delta == 'eventbrite_attendees') {
+    // Check cache settings changes.
+    if ((int) $edit['eventbrite_attendees_cache_length'] < variable_get('eventbrite_attendees_cache_length', 0)) {
+      // Clear cache.
+      cache_clear_all('*', 'cache_eventbrite_attendees', TRUE);
+    }
+
+    // Save settings.
+    variable_set('eventbrite_attendees_oauth_token', trim($edit['eventbrite_attendees_oauth_token']));
+    variable_set('eventbrite_attendees_event_id', trim($edit['eventbrite_attendees_event_id']));
+    variable_set('eventbrite_attendees_profile_fields', $edit['eventbrite_attendees_profile_fields']);
+    variable_set('eventbrite_attendees_cache_length', (int) $edit['eventbrite_attendees_cache_length']);
+  }
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function eventbrite_attendees_block_view($delta = '') {
+  $block = array();
+
+  switch ($delta) {
+    case 'eventbrite_attendees':
+      // Get event ID.
+      $node = menu_get_object();
+      $event_id = token_replace(variable_get('eventbrite_attendees_event_id', '<demo>'), array('node' => $node));
+      // Define block.
+      $attendees = _eventbrite_attendees_get_attendees($event_id);
+      $block = array(
+        'subject' => t('Event attendees'),
+        'content' => theme('eventbrite_attendees', array('event_id' => $event_id, 'attendees' => $attendees)),
+      );
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Helper function that provides the profile standard fields as described at
+ * https://www.eventbrite.com/developer/v3/response_formats/attendee/.
+ *
+ * @param $selected
+ *   A boolean to return only the fields selected in block configuration.
+ */
+function _eventbrite_attendees_get_attendees_profile_fields($selected = FALSE) {
+  $default_fields = array(
+    // Basic fields.
+    'name' => array('enabled' => FALSE, 'label' => t('Name'), 'weight' => -18),
+    'email' => array('enabled' => FALSE, 'label' => t('Email'), 'weight' => -17),
+    'first_name' => array('enabled' => TRUE, 'label' => t('First name'), 'weight' => -19),
+    'last_name' => array('enabled' => TRUE, 'label' => t('Last name'), 'weight' => -20),
+
+    // Optional fields.
+    'prefix' => array('enabled' => FALSE, 'label' => t('Prefix'), 'weight' => -16), // the title or honoraria used in front of the name (Mr., Mrs., etc.)
+    'suffix' => array('enabled' => FALSE, 'label' => t('Suffix'), 'weight' => -15), // the suffix at the end of the name (e.g. Jr, Sr)
+    'age' => array('enabled' => FALSE, 'label' => t('Age'), 'weight' => -14),
+    'job_title' => array('enabled' => FALSE, 'label' => t('Job'), 'weight' => -13),
+    'company' => array('enabled' => FALSE, 'label' => t('Company'), 'weight' => -12),
+    'website' => array('enabled' => FALSE, 'label' => t('Website'), 'weight' => -11),
+    'blog' => array('enabled' => FALSE, 'label' => t('Blog'), 'weight' => -10),
+    'gender' => array('enabled' => FALSE, 'label' => t('Gender'), 'weight' => -9),
+    'birth_date' => array('enabled' => FALSE, 'label' => t('Birth date'), 'weight' => -8),
+    'cell_phone' => array('enabled' => FALSE, 'label' => t('Phone'), 'weight' => -7), // the cell/mobile phone number, as formatted by the attendee
+
+    'addresses.home.localized_address_display' => array('enabled' => FALSE, 'label' => t('Home address'), 'weight' => -6),
+    'addresses.home.localized_area_display' => array('enabled' => FALSE, 'label' => t('Home area'), 'weight' => -5),
+    'addresses.home.postal_code' => array('enabled' => FALSE, 'label' => t('Home postal code'), 'weight' => -4),
+    'addresses.home.country' => array('enabled' => FALSE, 'label' => t('Home country'), 'weight' => -3),
+    'addresses.home.region' => array('enabled' => FALSE, 'label' => t('Home region'), 'weight' => -2),
+    'addresses.home.city' => array('enabled' => FALSE, 'label' => t('Home city'), 'weight' => -1),
+
+    'addresses.ship.localized_address_display' => array('enabled' => FALSE, 'label' => t('Shipping address'), 'weight' => 0),
+    'addresses.ship.localized_area_display' => array('enabled' => FALSE, 'label' => t('Shipping area'), 'weight' => 1),
+    'addresses.ship.postal_code' => array('enabled' => FALSE, 'label' => t('Shipping postal code'), 'weight' => 2),
+    'addresses.ship.country' => array('enabled' => FALSE, 'label' => t('Shipping country'), 'weight' => 3),
+    'addresses.ship.region' => array('enabled' => FALSE, 'label' => t('Shipping region'), 'weight' => 4),
+    'addresses.ship.city' => array('enabled' => FALSE, 'label' => t('Shipping city'), 'weight' => 5),
+
+    'addresses.work.localized_address_display' => array('enabled' => FALSE, 'label' => t('Work address'), 'weight' => 6),
+    'addresses.work.localized_area_display' => array('enabled' => FALSE, 'label' => t('Work area'), 'weight' => 7),
+    'addresses.work.postal_code' => array('enabled' => FALSE, 'label' => t('Work postal code'), 'weight' => 8),
+    'addresses.work.country' => array('enabled' => FALSE, 'label' => t('Work country'), 'weight' => 9),
+    'addresses.work.region' => array('enabled' => FALSE, 'label' => t('Work region'), 'weight' => 10),
+    'addresses.work.city' => array('enabled' => FALSE, 'label' => t('Work city'), 'weight' => 11),
+  );
+
+  $fields = variable_get('eventbrite_attendees_profile_fields', array()) + $default_fields;
+  uasort($fields, 'drupal_sort_weight');
+  if ($selected) {
+    foreach ($fields as $id => $field) {
+      if (!$field['enabled']) {
+        unset($fields[$id]);
+      }
+    }
+  }
+
+  return $fields;
+}
+
+/**
+ * Helper function that queries the web service to get the list of attendees to
+ * the specified event.
+ */
+function _eventbrite_attendees_get_attendees($event_id) {
+  // Check event id.
+  if (empty($event_id)) {
+    return FALSE;
+  }
+
+  // Provide dummy and partial data for testing purposes.
+  if ($event_id == '<demo>') {
+    return array(
+      array('profile' => array('first_name' => 'John', 'last_name' => 'Doe')),
+      array('profile' => array('first_name' => 'Richard', 'last_name' => 'Roe')),
+    );
+  }
+
+  // Query cache.
+  $cid = 'eventbrite_attendees:event_' . $event_id;
+  if (variable_get('eventbrite_attendees_cache_length', 0) && ($cached = cache_get($cid, 'cache_eventbrite_attendees')) && ($cached->expire > REQUEST_TIME)) {
+    return $cached->data;
+  }
+
+  // Query web service.
+  $attendees = array();
+  $page = 1;
+  do {
+    // Get attendees.
+    $query = array('status' => 'attending', 'page' => $page++);
+    $headers = array('Authorization' => 'Bearer ' . variable_get('eventbrite_attendees_oauth_token', ''));
+    $url = url(EVENTBRITE_ATTENDEES_ENDPOINT . '/events/' . $event_id . '/attendees/', array('query' => $query));
+    $response = drupal_http_request($url, array('headers' => $headers));
+    if ($response && $response->code == 200) {
+      $data = drupal_json_decode($response->data);
+      $attendees = array_merge($attendees, $data['attendees']);
+    }
+    else {
+      // Notify and log error.
+      $error_message = 'Error querying or retrieving data from Eventbrite.';
+      if (user_access('administer site configuration')) {
+        drupal_set_message($error_message, 'error');
+      }
+      watchdog(
+        'eventbrite_attendees',
+        $error_message . '<br>Response dump:<pre>!response</pre>',
+        array('!response' => print_r($response, TRUE)),
+        WATCHDOG_ERROR,
+        l('check settings', 'admin/structure/block/manage/eventbrite_attendees/eventbrite_attendees/configure')
+      );
+      return FALSE;
+    }
+  } while ($data['pagination']['has_more_items']);
+  // Cache query result.
+  cache_set($cid, $attendees, 'cache_eventbrite_attendees', REQUEST_TIME + variable_get('eventbrite_attendees_cache_length', 0));
+
+  return $attendees;
+}
+
+/**
+ * Default comparison function for data sorting.
+ */
+function _eventbrite_attendees_name_sort($a, $b) {
+  // Sort by last and first name.
+  return ($cmp = strcasecmp($a['profile']['last_name'], $b['profile']['last_name'])) == 0 ? strcasecmp($a['profile']['first_name'], $b['profile']['first_name']) : $cmp;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function eventbrite_attendees_theme() {
+  return array(
+    'eventbrite_attendees' => array(
+      'variables' => array(
+        'event_id' => NULL,
+        'attendees' => array(),
+        'profile' => array(),
+        'comparator' => NULL,
+      ),
+    ),
+    'eventbrite_attendees_profile_fields' => array(
+      'render element' => 'element',
+    ),
+  );
+}
+
+/**
+ * Theming function for block content.
+ *
+ * @param $variables
+ *   An associative array containing:
+ *   - event_id: The event identifier.
+ *   - attendees: An array containing the attendee list.
+ *   - profile: An array containing the profile info to display as in
+ *     _eventbrite_attendees_get_attendees_profile_fields(). (optional,
+ *     overrides configuration settings)
+ *   - comparator: A callable comparison function used to sort data. (optional,
+ *     overrides default sorting criteria)
+ */
+function theme_eventbrite_attendees($variables) {
+  $event_id = $variables['event_id'];
+  $attendees = $variables['attendees'];
+  $fields = empty($variables['profile']) ? _eventbrite_attendees_get_attendees_profile_fields(TRUE) : $variables['profile'];
+  $comparator = empty($variables['comparator']) ? '_eventbrite_attendees_name_sort' : $variables['comparator'];
+
+  // Add style definitions.
+  drupal_add_css(drupal_get_path('module', 'eventbrite_attendees') . '/eventbrite_attendees.css');
+
+  // Render data table.
+  if ($attendees) {
+    // Sort list.
+    usort($attendees, $comparator);
+
+    // Prepare header.
+    $header = array();
+    foreach ($fields as $field) {
+      $header[] = $field['label'];
+    }
+
+    // Prepare list.
+    $rows = array();
+    foreach ($attendees as $attendee) {
+      // Filter and rearrange profile fields.
+      foreach ($fields as $field => $data) {
+        $subfields = explode('.', $field);
+        if ($subfields[0] == 'addresses') {
+          $data = isset($attendee['profile'][$subfields[0]][$subfields[1]][$subfields[2]]) ? $attendee['profile'][$subfields[0]][$subfields[1]][$subfields[2]] : NULL;
+        }
+        else {
+          $data = isset($attendee['profile'][$field]) ? $attendee['profile'][$field] : NULL;
+        }
+        $row[$field] = array(
+          'data' => isset($data) ? $data : t('-'),
+          'class' => drupal_html_class($field),
+        );
+      }
+      $rows[] = $row;
+    }
+
+    // Render table.
+    $content = theme_table(array(
+      'header' => $header,
+      'rows' => $rows,
+      'attributes' => array('class' => 'event-' . $event_id),
+      'caption' => '',
+      'colgroups' => array(),
+      'sticky' => FALSE,
+      'empty' => '',
+    ));
+  }
+  elseif ($attendees !== FALSE) {
+    $content = t('No attendees yet.');
+  }
+  else {
+    $content = t('Information temporarily unavailable.');
+  }
+
+  return $content;
+}
+
+/**
+ * Theming function for the profile fields configuration form element.
+ *
+ * @param $variables
+ *   An associative array describing a form element.
+ */
+function theme_eventbrite_attendees_profile_fields($variables) {
+  $element = $variables['element'];
+
+  // Prepare header.
+  $header = array(
+    'enabled' => t('Select/Rearrange'),
+    'label' => t('Label'),
+    'weight' => t('Weight'),
+  );
+
+  // Prepare field configuration controls.
+  $rows = array();
+  foreach (element_children($element) as $field) {
+    $row = array();
+    $row['data'] = array();
+    foreach ($header as $attribute => $label) {
+      $row['data'][] = drupal_render($element[$field][$attribute]);
+      $row['class'] = array('draggable');
+    }
+    $rows[] = $row;
+  }
+
+  // Render draggable table.
+  $output = theme('form_element_label', $variables);
+  $output .= theme('table', array(
+    'header' => $header,
+    'rows' => $rows,
+    'attributes' => array('id' => $element['#id']),
+  ));
+  drupal_add_tabledrag($element['#id'], 'order', 'sibling', 'eventbrite-attendees-profile-field-weight');
+
+  return $output;
+}

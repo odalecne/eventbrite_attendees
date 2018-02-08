@@ -1,0 +1,11 @@
+/**
+ * @file
+ * Stylesheet for the block provided by the Eventbrite Attendees module.
+ */
+
+/* Name capitalization */
+#block-eventbrite-attendees-eventbrite-attendees td.name,
+#block-eventbrite-attendees-eventbrite-attendees td.last-name,
+#block-eventbrite-attendees-eventbrite-attendees td.first-name {
+  text-transform: capitalize;
+}
