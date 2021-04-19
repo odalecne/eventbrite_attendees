@@ -1,0 +1,7 @@
+*.inc       linguist-language=PHP
+*.info      linguist-language=INI
+*.install   linguist-language=PHP
+*.module    linguist-language=PHP
+*.profile   linguist-language=PHP
+*.theme     linguist-language=PHP
+README.txt  linguist-language=Markdown
